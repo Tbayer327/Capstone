@@ -1,0 +1,787 @@
+---
+title: "Capstone"
+author: "Tom Bayer"
+date: "8/05/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Section 1: Read in the necessary packages for analysis
+
+```{r warning=FALSE, echo=FALSE, results=FALSE,message=FALSE }
+#Import the necessary libraries
+library(MASS)
+library(ggplot2)
+library(Hmisc)
+library(corrplot)
+library(dplyr)
+library(randomForest)
+library(tidyr)
+library(plyr)
+```
+
+### Section 2: Preparing the data for analysis
+
+```{r}
+#Read in the data set
+surgery=read.csv("SurgeryTiming.csv")
+
+#Remove dummy values
+surgery$gender[surgery$gender == ""] <- NA
+surgery$asa_status[surgery$asa_status == ""] <- NA
+surgery$race[surgery$race == ""] <- NA
+surgery$bmi[surgery$bmi == ""] <- NA
+
+surgery$hour = as.numeric(sub("\\..*", "", as.character(surgery$hour))) #Split out the base hour of surgery
+
+#Drop NA values
+surgery = surgery %>% drop_na(gender)
+surgery = surgery %>% drop_na(asa_status)
+surgery = surgery %>% drop_na(race)
+surgery = surgery %>% drop_na(age)
+surgery = surgery %>% drop_na(bmi)
+
+#Drop additional levels that now have no values
+surgery$gender = droplevels(surgery$gender)
+surgery$asa_status = droplevels(surgery$asa_status)
+surgery$race = droplevels(surgery$race)
+
+#Change binary variables to 0 and 1 for simplicity
+surgery$complication=revalue(surgery$complication,c("Yes"=1)) 
+surgery$complication=revalue(surgery$complication,c("No"=0))
+surgery$mort30=revalue(surgery$mort30,c("Yes"=1))
+surgery$mort30=revalue(surgery$mort30,c("No"=0))
+
+#View our numeric data distributions
+num_data <- surgery[,sapply(surgery,is.numeric)]
+hist.data.frame(num_data)
+summary(surgery)
+```
+
+### Section 3: Understanding the Effect of Timing on Patient Outcome
+```{r}
+#######################
+#### Complications ####
+#######################
+
+#Set Reference Variables
+compData=surgery
+compData = within(compData,dow <- relevel(dow,ref="Mon"))
+compData = within(compData,month <- relevel(month,ref="Jan"))
+
+glmComplication=glm(complication~ahrq_ccs+hour+dow+month,data=compData,family="binomial") #Fit a model for Complications rate
+summary(glmComplication)
+
+exp(coef(glmComplication))
+
+complications=surgery[surgery$complication==1,]
+nocomplications=surgery[surgery$complication==0,]
+#Bar plot for complications by hour
+
+ggplot(data=complications,aes(x=factor(hour)))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + xlab("Hour")+ylab("Number of Complications")+ggtitle("Complications By Hour")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+#Bar plot for complications by dow
+ggplot(data=complications,aes(x=factor(dow,level=c("Mon","Tue","Wed","Thu","Fri"))))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + xlab("Day of Week")+ylab("Number of Complications")+ggtitle("Complications By Day of Week")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+#Bar plot for complications by month
+ggplot(data=complications,aes(x=factor(month,level=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + xlab("Month")+ylab("Number of Complications")+ggtitle("Complications By Month")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+surgery %>% group_by(month) %>% tally(complication==0) %>% arrange(desc(n))
+
+
+#######################
+####   Mortality   ####
+#######################
+mortData=surgery
+#Set Reference Variables
+mortData = within(mortData,dow <- relevel(dow,ref="Mon"))
+mortData = within(mortData,month <- relevel(month,ref="Jan"))
+
+glmMortality=glm(mort30~ahrq_ccs+hour+dow+month,data=mortData,family="binomial") #Fit a model for mortality rates
+summary(glmMortality) #View output and Coefficients
+
+exp(coef(glmMortality))
+
+mortality=surgery[surgery$mort30==1,]
+nomortality=surgery[surgery$mort30==0,]
+
+summary(mortality)
+#Bar plot for mortality by hour
+
+ggplot(data=mortality,aes(x=factor(hour)))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + xlab("Hour")+ylab("Number of Mortalities")+ggtitle("Mortalities By Hour")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+#Bar plot for mortality by dow
+ggplot(data=mortality,aes(x=factor(dow,level=c("Mon","Tue","Wed","Thu","Fri"))))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + xlab("Day of Week")+ylab("Number of Mortalities")+ggtitle("Mortalities By Day of Week")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+#Bar plot for mortality by month
+ggplot(data=mortality,aes(x=factor(month,level=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + xlab("Month")+ylab("Number of Mortalities")+ggtitle("Mortalities By Month")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### Section 4: Predicting Patient Outcome
+This section will walk through the steps taken in order to create models to predict the likliehood of a patient experiencing a complication or death 30 days following an elective procedure based on underlying health conditions.
+```{r}
+#Beign Modeling process for predicting complications/morality rate based on patients underlying health conditions
+
+HealthStatusSubset = surgery[,c(-3,-4,-15,-16,-17,-18,-19,-20,-21,-22,-23)] #Create a subset of data that only includes the necessary fields.
+```
+
+Define the two models, one for complication and one for mortality. These will contain the same predictor variables, but the response variable will be changed accordingly. 
+```{r}
+#Create the two models, one for Complications and one for Mortality. Both will contain the same predictor variables
+Model1Comp = (complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary)
+allModelComp = list(Model1Comp)
+
+Model1Mort = (mort30 ~ ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary)
+allModelMort = list(Model1Mort)
+```
+
+
+######################################################
+######################################################
+######            Complication Section         #######
+######################################################
+######################################################
+
+
+
+Modeling Process via 10 Fold Cross Validation for Complications
+```{r warning=FALSE}
+##############################################
+###             Complication               ###
+##############################################
+###        Model Selection Process         ###
+##############################################
+
+set.seed(8,sample.kind="Rounding")
+xy.in=HealthStatusSubset
+n.in=dim(xy.in)[1]
+ncv=10
+
+if ((n.in%%ncv) == 0) { #Create out CV groups
+        groups.in= rep(1:ncv,floor(n.in/ncv))} else {
+        groups.in=c(rep(1:ncv,floor(n.in/ncv)),(1:(n.in%%ncv)))
+       }
+
+cvgroups.in = sample(groups.in,n.in) #Sample the CV groups for the input records
+allpredictedcv10 = matrix(,ncol=3,nrow=n.in) #Create the predicted results matrix
+
+
+for(m in 1:length(allModelComp)){
+  for(i in 1:ncv){
+    groupi = (cvgroups.in == i)
+    newdata.in = xy.in[cvgroups.in==i,]
+    
+    #LDA Model
+    ldafit = lda(allModelComp[[m]], data=xy.in, subset=(cvgroups.in!=i))       #Fit the current model using LDA with on the input data excluding the data in the current fold.
+    allpredictedcv10[cvgroups.in==i,m] = predict(ldafit,newdata.in)$class   #Predict the response from the data in the current fold and store into the matrix for that model.
+    
+    
+    #QDA Models
+    qdafit = qda(allModelComp[[m]], data=xy.in, subset=(cvgroups.in!=i))       #Fit the current model using QDA with on the input data excluding the data in the current fold.
+    allpredictedcv10[cvgroups.in==i,m+1] = predict(qdafit,newdata.in)$class #Predict the response from the data in the current fold and store into the matrix for that model.
+    
+    #Logistic Regression Models
+    fit=glm(allModelComp[[m]],data=xy.in,subset=(cvgroups.in!=i),family="binomial")
+    test=predict(fit,newdata.in,type="response")
+    log5fact=rep(1,dim(newdata.in)[1]);log5fact[test>0.50] = 2
+    allpredictedcv10[groupi,m+2]=log5fact
+    
+  }
+}
+
+allpredictedcv10=allpredictedcv10-1
+allcv10 = rep(0,3)
+for (m in 1:3){
+  allcv10[m] = sum(xy.in$complication!=allpredictedcv10[,m])/n.in
+}
+bestmodels=(1:3)[allcv10==min(allcv10)]
+  if(bestmodels == 1){ #If the best model is less than or equal to 10, these refer to the LDA models
+    model="LDA"
+  }
+  if (bestmodels ==2){ #If the best model is between 11 and 20, these refer to the QDA models
+    model="QDA"
+  }
+  if (bestmodels ==3) { #If the best model is greater than 20 , these refer to the logisitc regression models
+    model = "Logistic Regression"
+  }
+
+FinalModel=allModelComp[1]
+print(paste0("The best model method was ", model, " using the formula (", FinalModel ,") which produced a CV error rate of: " , signif(allcv10[bestmodels],digits=5), " (or ", signif(allcv10[bestmodels],digits=5)*100, "%)" )) #Printing my results in a presentable manner
+##############################################
+###        End Selection Process           ###
+##############################################
+print(paste0("LDA Error Rate: " ,allcv10[1]))
+print(paste0("QDA Error Rate: " ,allcv10[2]))
+print(paste0("Logistic Regression Error Rate: " ,allcv10[3]))
+```
+###### Interpreting the Results
+
+From the output, it can be seen that performing Logistic Regression on the model yielded the best model results. This model yields the lowest overall error rate of 13.27%. This model will be used to fit on the full dataset to get the most accurate coefficients for the predictor variables. By performing 1 layer of cross-validation, it can lead to underestimating the overall error rate of the model. To account for this underestimate, double cross-validation will be performed on the model selection process to validate our results. 
+
+Inside of the double cross validation, a new modeling method will also be considered. Random Forests will be introduced into the model fitting process to determine if the overall accuracy of prediction can be improved. Before performing double cross validation with Random Forests included, it is first important to determine the optimal value of 'mtry'. In order to determine which value of `mtry` produces the lowest overall error rate, a for loop will be used to loop over each individual value 1 to 11 (number of predictors considered at each split). By stripping the error rate of this model and storing it into a list, the lowest overall error rate will be selected and the `mtry` value used to obtain that error rate will be used in the final model. All predictor variables will be considered for the Random Forest.
+
+```{r}
+#Random Forest - Complications
+set.seed(8,sample.kind="Rounding")
+errorRatesComp=rep(0,11) #Create placeholders for all error rates for every value of mtry
+
+#Loop through the modeling process changing the value of mtry with each iteration
+for (i in 1:11){
+surgery.bag=randomForest(complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=i,importance=T )
+errorRatesComp[i] = tail(surgery.bag$err.rate[,1],1) #Store the error rates of the current model into the placeholder variable
+}
+
+ErrRateFinal = data.frame(seq(1:length(errorRatesComp)),errorRatesComp) #Enumerate the error rates
+
+names(ErrRateFinal)[1]="mtry" #Rename Columns
+names(ErrRateFinal)[2]="error_rate" #Rename Columns
+min(ErrRateFinal$error_rate) #Determine which 'mtry' value had the lowest overall error rate
+
+ggplot(data=ErrRateFinal,aes(x=mtry,y=error_rate))+ geom_line(color="grey")+geom_point(shape=21,color="black",fill="#69b3a2",size=3)+scale_x_continuous(limits = c(1, 11), breaks = 1:11)+ggtitle("Complication Error Rates Related to MTRY Value")+
+  theme(plot.title = element_text(hjust = 0.5))+xlab("MTRY Value")+ylab("Error Rate") #Plot all error rates for visual representation
+
+```
+
+
+From the plot above, it can be seen that the `mtry` value of 2 produces the model with the lowest overall error rate. Given this, the random forest will now be modeled using this value to get the importance of each variable in the model. Given the optimal value of `mtry` has now been identified, the below code will perform double cross validation to determine the accurate error rates of the LDA, QDA, Logistic Regression, and Random Forest Models.
+
+```{r}
+xy.out=HealthStatusSubset
+n.out=dim(xy.out)[1]
+k.out=10
+groups.out = c(rep(1:k.out,floor(n.out/k.out)),1:(n.out%%k.out))  #produces list of group labels
+set.seed(8, sample.kind = "Rounding")
+cvgroups.out = sample(groups.out,n.out)  #orders randomly, with seed (8) 
+
+allpredictedCV.out = rep(NA,n.out)   #Create the predicted results matrix 
+RandomForestpredictedCV.out = rep(NA,n.out)   #Create the predicted results matrix for RandomForest
+allbestmodels = rep(NA,k.out)       #Variable to store every folds best model.
+
+#############################################
+###     model assessment OUTER shell      ###
+#############################################
+j=1
+for (j in 1:k.out)  {  #Loop over our outer validation 
+  groupj.out = (cvgroups.out == j)  #outer loop fold groups
+
+  # define the training set for outer loop
+  trainxy.out = xy.out[!groupj.out,]
+  
+  #define the validation set for outer loop
+  testxy.out = xy.out[groupj.out,]
+
+
+##############################################
+###             Complication               ###
+##############################################
+###        Model Selection Process         ###
+##############################################
+
+set.seed(8,sample.kind="Rounding")
+xy.in=trainxy.out
+n.in=dim(xy.in)[1]
+ncv=10
+
+if ((n.in%%ncv) == 0) { #Create out CV groups
+        groups.in= rep(1:ncv,floor(n.in/ncv))} else {
+        groups.in=c(rep(1:ncv,floor(n.in/ncv)),(1:(n.in%%ncv)))
+       }
+
+cvgroups.in = sample(groups.in,n.in) #Sample the CV groups for the input records
+allpredictedcv10 = matrix(,ncol=3,nrow=n.in) #Create the predicted results matrix
+
+
+for(m in 1:length(allModelComp)){
+  for(i in 1:ncv){
+    groupi = (cvgroups.in == i)
+    newdata.in = xy.in[cvgroups.in==i,]
+    
+    #LDA Model
+    ldafit = lda(allModelComp[[m]], data=xy.in, subset=(cvgroups.in!=i))       #Fit the current model using LDA with on the input data excluding the data in the current fold.
+    allpredictedcv10[cvgroups.in==i,m] = predict(ldafit,newdata.in)$class   #Predict the response from the data in the current fold and store into the matrix for that model.
+    
+    
+    #QDA Models
+    qdafit = qda(allModelComp[[m]], data=xy.in, subset=(cvgroups.in!=i))       #Fit the current model using QDA with on the input data excluding the data in the current fold.
+    allpredictedcv10[cvgroups.in==i,m+1] = predict(qdafit,newdata.in)$class #Predict the response from the data in the current fold and store into the matrix for that model.
+    
+    #Logistic Regression Models
+    fit=glm(allModelComp[[m]],data=xy.in,subset=(cvgroups.in!=i),family="binomial")
+    test=predict(fit,newdata.in,type="response")
+    log5fact=rep(1,dim(newdata.in)[1]);log5fact[test>0.5] = 2
+    allpredictedcv10[groupi,m+2]=log5fact
+    
+  }
+}
+
+allpredictedcv10=allpredictedcv10-1
+allcv10 = rep(0,3)
+for (m in 1:3){
+  allcv10[m] = sum(xy.in$complication!=allpredictedcv10[,m])/n.in
+}
+bestmodels=(1:3)[allcv10==min(allcv10)]
+
+
+
+bestmodel = ifelse(length(bestmodels)==1,bestmodels,sample(bestmodels,1)) #Determine the best model for the current fold
+allbestmodels[j] = bestmodel #Store the best model for each fold to analyze at the end  
+  if(bestmodel == 1){ #If the best model is less than or equal to 10, these refer to the LDA models
+      lda2fit.train=lda(allModelComp[[1]], data=trainxy.out)
+      predictvalid = as.numeric(predict(lda2fit.train, testxy.out)$class) #predict on outer validation data in the current fold
+      }
+  if (bestmodel ==2){ #If the best model is between 11 and 20, these refer to the QDA models
+      qda2fit.train=qda(allModelComp[[1]], data=trainxy.out)
+      predictvalid = as.numeric(predict(qda2fit.train, testxy.out)$class) #predict on outer validation data in the current fold
+  }
+  if (bestmodel ==3) { #If the best model is greater than 20 , these refer to the logisitc regression models
+    log2fit.train = glm(allModelComp[[1]], data= trainxy.out, family=binomial) #Fit the model on the data not in the current fold
+    log2prob.test = predict(log2fit.train,testxy.out,type="response") #predict on outer validation data in the current fold
+    predictvalid = rep(1,dim(testxy.out)[1]); predictvalid[log2prob.test > 0.50] = 2
+  }
+    predictvalid = predictvalid-1  #Since the output matrix currently contains all 1's and 2's subtract 1 so the values can be compared to the original dataset.
+    allpredictedCV.out[groupj.out] = predictvalid #Store the predicted values from the current group into our output
+
+    
+    
+    surgery.bag = randomForest(complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=trainxy.out,mtry=2,importance=T)
+surgery.bag
+
+RandomForestpredictedCV.out[groupj.out]= predict(surgery.bag,testxy.out,type="response") #Predict the wine quality of the outer loop test set 
+
+}
+table(HealthStatusSubset$complication,allpredictedCV.out) #Create a table comparing predicted values to actual values
+CV10.out = sum(HealthStatusSubset$complication!=allpredictedCV.out)/n.out #Calculate the error rate the best model
+p.out = 1-CV10.out;  # Calculate the accuracy of the best model
+
+RandomForestpredictedCV.out=RandomForestpredictedCV.out-1
+RandomForest.out = sum(HealthStatusSubset$complication!=RandomForestpredictedCV.out)/n.out #Calculate the error rate the best model
+RFfinal=1-RandomForest.out; #Calculate the accuracy of the Random Forest Model
+
+print(paste0("The accuracy for the best model at each individual outer loop split is: " , signif(p.out,digits=4)*100,"%"))
+print(paste0("The accuracy for the Random Forest model is: " , signif(RFfinal,digits=4)*100,"%"))
+##############################################
+###        End Selection Process           ###
+##############################################
+```
+From the results, it can be seen that all models provide relatively the same overall error rate, with Random Forests performing slightly better. Given this, it is important to fit the random forest using the full surgery data set in order to understand important relationships among the variables. This code will also fit the full dataset using Logistic Regression since that was the preferred model in the first model selection.
+
+```{r}
+#Create the full logistic regression model for predicting where the chances of an operation having a complication
+fullModelComp = glm(complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,family="binomial")
+
+summary(fullModelComp) #Receive coefficients for complication model
+
+exp(coef(fullModelComp)) #Retrieve odds ratio for complication model
+```
+
+Predicting on new patient data
+```{r}
+#Create Patient 1, an older individual with many underlying health conditions who is getting a colorectal resection procedure completed.
+newPatient1=data.frame(ahrq_ccs="Colorectal resection",age=70,asa_status="IV-VI",bmi=27.9,baseline_cancer="Yes",baseline_cvd="Yes",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="No",baseline_psych="No",baseline_pulmonary="No")
+Patient1 = predict(fullModelComp, newPatient1, type="response")
+
+newPatient2=data.frame(ahrq_ccs="Hip replacement; total and partial",age=34,asa_status="I-II",bmi=22.9,baseline_cancer="No",baseline_cvd="No",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="No",baseline_psych="No",baseline_pulmonary="No")
+Patient2 = predict(fullModelComp, newPatient2, type="response")
+
+
+Determine_Complication = function(prediction){
+  if(prediction > .10){
+    Response=paste("High Risk:", round(prediction*100,2) ,"% Chance of Complication")
+    return(Response)
+  }
+  else{
+    Response=paste("Low Risk:", round(prediction*100,2) ,"% Chance of Complication")
+    return(Response)
+  }
+}
+
+print(paste0("Patient 1 Results - ", Determine_Complication(Patient1)))
+print(paste0("Patient 2 Results - ", Determine_Complication(Patient2)))
+```
+
+```{r}
+#Set Patient 1 to have the same levels as used in training. Necessary for Random Forest Predictions
+newPatient1=data.frame(ahrq_ccs="Colorectal resection",age=70,asa_status="IV-VI",bmi=27.9,baseline_cancer="Yes",baseline_cvd="Yes",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="No",baseline_psych="No",baseline_pulmonary="No")
+
+newPatient1$ahrq_ccs = factor(newPatient1$ahrq_ccs, levels = c("<Other>","Arthroplasty knee","Colorectal resection","Endoscopy and endoscopic biopsy of the urinary tract","Gastrectomy; partial and total","Genitourinary incontinence procedures","Hip replacement; total and partial","Hysterectomy; abdominal and vaginal","Inguinal and femoral hernia repair","Laminectomy; excision intervertebral disc","Lumpectomy; quadrantectomy of breast","Mastectomy","Nephrectomy; partial or complete","Oophorectomy; unilateral and bilateral","Open prostatectomy","Other excision of cervix and uterus","Other hernia repair","Plastic procedures on nose","Repair of cystocele and rectocele; obliteration of vaginal vault","Small bowel resection","Spinal fusion","Thyroidectomy; partial or complete","Transurethral resection of prostate (TURP)"))
+newPatient1$asa_status = factor(newPatient1$asa_status, levels = c("I-II","III","IV-VI"))
+newPatient1$baseline_cancer = factor(newPatient1$baseline_cancer, levels = c("No","Yes"))
+newPatient1$baseline_cvd = factor(newPatient1$baseline_cvd, levels = c("No","Yes"))
+newPatient1$baseline_dementia = factor(newPatient1$baseline_dementia, levels = c("No","Yes"))
+newPatient1$baseline_diabetes = factor(newPatient1$baseline_diabetes, levels = c("No","Yes"))
+newPatient1$baseline_digestive = factor(newPatient1$baseline_digestive, levels = c("No","Yes"))
+newPatient1$baseline_osteoart = factor(newPatient1$baseline_osteoart, levels = c("No","Yes"))
+newPatient1$baseline_psych = factor(newPatient1$baseline_psych, levels = c("No","Yes"))
+newPatient1$baseline_pulmonary = factor(newPatient1$baseline_pulmonary, levels = c("No","Yes"))
+
+#Set Patient 2 to have the same levels as used in training. Necessary for Random Forest Predictions
+
+newPatient2=data.frame(ahrq_ccs="Hip replacement; total and partial",age=34,asa_status="I-II",bmi=22.9,baseline_cancer="No",baseline_cvd="No",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="No",baseline_psych="No",baseline_pulmonary="No")
+newPatient2$ahrq_ccs = factor(newPatient2$ahrq_ccs, levels = c("<Other>","Arthroplasty knee","Colorectal resection","Endoscopy and endoscopic biopsy of the urinary tract","Gastrectomy; partial and total","Genitourinary incontinence procedures","Hip replacement; total and partial","Hysterectomy; abdominal and vaginal","Inguinal and femoral hernia repair","Laminectomy; excision intervertebral disc","Lumpectomy; quadrantectomy of breast","Mastectomy","Nephrectomy; partial or complete","Oophorectomy; unilateral and bilateral","Open prostatectomy","Other excision of cervix and uterus","Other hernia repair","Plastic procedures on nose","Repair of cystocele and rectocele; obliteration of vaginal vault","Small bowel resection","Spinal fusion","Thyroidectomy; partial or complete","Transurethral resection of prostate (TURP)"))
+newPatient2$asa_status = factor(newPatient2$asa_status, levels = c("I-II","III","IV-VI"))
+newPatient2$baseline_cancer = factor(newPatient2$baseline_cancer, levels = c("No","Yes"))
+newPatient2$baseline_cvd = factor(newPatient2$baseline_cvd, levels = c("No","Yes"))
+newPatient2$baseline_dementia = factor(newPatient2$baseline_dementia, levels = c("No","Yes"))
+newPatient2$baseline_diabetes = factor(newPatient2$baseline_diabetes, levels = c("No","Yes"))
+newPatient2$baseline_digestive = factor(newPatient2$baseline_digestive, levels = c("No","Yes"))
+newPatient2$baseline_osteoart = factor(newPatient2$baseline_osteoart, levels = c("No","Yes"))
+newPatient2$baseline_psych = factor(newPatient2$baseline_psych, levels = c("No","Yes"))
+newPatient2$baseline_pulmonary = factor(newPatient2$baseline_pulmonary, levels = c("No","Yes"))
+
+
+surgery.bagComp = randomForest(complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.90,0.10)) #The cutoff is the probability for each group selection, probs of 10% or higher are classified as 'Complication' occurring
+
+RFPred1=predict(surgery.bagComp,newPatient1,type="prob")[2]
+RFPred2=predict(surgery.bagComp,newPatient2,type="prob")[2]
+
+print(paste0("Patient 1 Results - ", Determine_Complication(RFPred1)))
+print(paste0("Patient 2 Results - ", Determine_Complication(RFPred2)))
+```
+
+Full Random Forest Model
+```{r}
+#Random Forest - Complications Threshold Tuning
+
+set.seed(8,sample.kind="Rounding")
+
+surgery.bagComp = randomForest(complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.90,0.10)) #The cutoff is the probability for each group selection, probs of 10% or higher are classified as 'Complication' occurring
+
+surgery.bagComp #Get stats for random forest model
+
+imp=as.data.frame(importance(surgery.bagComp)) #Analyze the importance of each variable in the model
+imp = cbind(vars=rownames(imp), imp)
+imp = imp[order(imp$MeanDecreaseAccuracy),]
+imp$vars = factor(imp$vars, levels=imp$vars)
+dotchart(imp$MeanDecreaseAccuracy, imp$vars, 
+         xlim=c(0,max(imp$MeanDecreaseAccuracy)), pch=16,xlab = "Mean Decrease Accuracy",main = "Complications - Variable Importance Plot",color="black")
+```
+From the results above, when fitting the Random Forest model on the full dataset, and specifying a threshold of 10% to be considered a high risk of complication occuring, the models overall accuracy is 84.14% correct. In class accuracy is as follows:
+
+* Correctly Predicting No Complication - 94.36% Accurate
+* Correctly Predicting Complications - 17.11% Accurate
+
+
+######################################################
+######################################################
+######            Mortality Section            #######
+######################################################
+######################################################
+
+```{r warning=FALSE}
+##############################################
+###             Mortality                  ###
+##############################################
+###        Model Selection Process         ###
+##############################################
+
+set.seed(8,sample.kind="Rounding")
+xy.in=HealthStatusSubset
+n.in=dim(xy.in)[1]
+ncv=10
+
+if ((n.in%%ncv) == 0) { #Create out CV groups
+        groups.in= rep(1:ncv,floor(n.in/ncv))} else {
+        groups.in=c(rep(1:ncv,floor(n.in/ncv)),(1:(n.in%%ncv)))
+       }
+
+cvgroups.in = sample(groups.in,n.in) #Sample the CV groups for the input records
+allpredictedcv10 = matrix(,ncol=2,nrow=n.in) #Create the predicted results matrix
+
+
+for(m in 1:length(allModelMort)){
+  for(i in 1:ncv){
+    groupi = (cvgroups.in == i)
+    newdata.in = xy.in[cvgroups.in==i,]
+    
+    #LDA Model
+    ldafit = lda(allModelMort[[m]], data=xy.in, subset=(cvgroups.in!=i))       #Fit the current model using LDA with on the input data excluding the data in the current fold.
+    allpredictedcv10[cvgroups.in==i,m] = predict(ldafit,newdata.in)$class   #Predict the response from the data in the current fold and store into the matrix for that model.
+    
+    
+    #Logistic Regression Models
+    fit=glm(allModelMort[[m]],data=xy.in,subset=(cvgroups.in!=i),family="binomial")
+    test=predict(fit,newdata.in,type="response")
+    log5fact=rep(1,dim(newdata.in)[1]);log5fact[test>0.5] = 2
+    allpredictedcv10[groupi,m+1]=log5fact
+    
+  }
+}
+allpredictedcv10=allpredictedcv10-1
+allcv10 = rep(0,2)
+for (m in 1:2){
+  allcv10[m] = sum(xy.in$complication!=allpredictedcv10[,m])/n.in
+}
+bestmodels=(1:2)[allcv10==min(allcv10)]
+  if(bestmodels == 1){ #If the best model is less than or equal to 10, these refer to the LDA models
+    model="LDA"
+  }
+  if (bestmodels ==2) { #If the best model is greater than 20 , these refer to the logisitc regression models
+    model = "Logistic Regression"
+  }
+
+FinalModel=allModelMort[1]
+print(paste0("The best model method was ", model, " using the formula (", FinalModel ,") which produced a CV error rate of: " , signif(allcv10[bestmodels],digits=5), " (or ", signif(allcv10[bestmodels],digits=5)*100, "%)" )) #Printing my results in a presentable manner
+##############################################
+###        End Selection Process           ###
+##############################################
+print(paste0("LDA Error Rate: " ,allcv10[1]))
+print(paste0("Logistic Regression Error Rate: " ,allcv10[2]))
+```
+From the output, it can be seen that performing logisitc regression on the mortality model yielded the best model results. This model yields the lowest overall erro rrate of 13.24%. This model will be used to fit on the full dataset to get the most accurate coefficients for the predictor variables. By performing 1 layer of cross-validation, it can lead to underestimating the overall error rate of the model. To account for this underestimate, double cross-validation will be performed on the model selection process to validate our results. 
+
+Inside of the double cross validation, a new modeling method will also be considered. Random Forests will be introduced into the model fitting process to determine if the overall accuracy of prediction can be improved. Before performing double cross validation with Random Forests included, it is first important to determine the optimal value of 'mtry'. In order to determine which value of `mtry` produces the lowest overall error rate, a for loop will be used to loop over each individual value 1 to 11 (number of predictors considered at each split). By stripping the error rate of this model and storing it into a list, the lowest overall error rate will be selected and the `mtry` value used to obtain that error rate will be used in the final model. All predictor variables will be considered for the Random Forest.
+
+```{r}
+#Random Forest - Mortality
+set.seed(8,sample.kind="Rounding")
+errorRatesMort=rep(0,11) #Create placeholders for all error rates for every value of mtry
+
+#Loop through the modeling process changing the value of mtry with each iteration
+for (i in 1:11){
+surgery.bag=randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=i,importance=T )
+errorRatesMort[i] = tail(surgery.bag$err.rate[,1],1) #Store the error rates of the current model into the placeholder variable
+}
+
+ErrRateFinal = data.frame(seq(1:length(errorRatesMort)),errorRatesMort) #Enumerate the error rates
+
+names(ErrRateFinal)[1]="mtry" #Rename Columns
+names(ErrRateFinal)[2]="error_rate" #Rename Columns
+min(ErrRateFinal$error_rate) #Determine which 'mtry' value had the lowest overall error rate
+
+ggplot(data=ErrRateFinal, aes(x=mtry,y=error_rate))+ geom_line(color="grey")+geom_point(shape=21,color="black",fill="#69b3a2",size=3)+scale_x_continuous(limits = c(1, 11), breaks = 1:11)+ggtitle("Mortality Error Rates Related to MTRY Value")+
+  theme(plot.title = element_text(hjust = 0.5))+xlab("MTRY Value")+ylab("Error Rate") #Plot all error rates for visual representation #Plot all error rates for visual representation
+
+
+```
+
+
+```{r}
+xy.out=HealthStatusSubset
+n.out=dim(xy.out)[1]
+k.out=10
+groups.out = c(rep(1:k.out,floor(n.out/k.out)),1:(n.out%%k.out))  #produces list of group labels
+set.seed(8, sample.kind = "Rounding")
+cvgroups.out = sample(groups.out,n.out)  #orders randomly, with seed (8) 
+
+allpredictedCV.out = rep(NA,n.out)   #Create the predicted results matrix 
+RandomForestpredictedCV.out = rep(NA,n.out)   #Create the predicted results matrix for RandomForest
+allbestmodels = rep(NA,k.out)       #Variable to store every folds best model.
+
+#############################################
+###     model assessment OUTER shell      ###
+#############################################
+j=1
+for (j in 1:k.out)  {  #Loop over our outer validation 
+  groupj.out = (cvgroups.out == j)  #outer loop fold groups
+
+  # define the training set for outer loop
+  trainxy.out = xy.out[!groupj.out,]
+  
+  #define the validation set for outer loop
+  testxy.out = xy.out[groupj.out,]
+
+
+##############################################
+###             Mortality                  ###
+##############################################
+###        Model Selection Process         ###
+##############################################
+  
+set.seed(8,sample.kind="Rounding")
+xy.in=trainxy.out
+n.in=dim(xy.in)[1]
+ncv=10
+
+if ((n.in%%ncv) == 0) { #Create out CV groups
+        groups.in= rep(1:ncv,floor(n.in/ncv))} else {
+        groups.in=c(rep(1:ncv,floor(n.in/ncv)),(1:(n.in%%ncv)))
+       }
+
+cvgroups.in = sample(groups.in,n.in) #Sample the CV groups for the input records
+allpredictedcv10 = matrix(,ncol=2,nrow=n.in) #Create the predicted results matrix
+
+
+for(m in 1:length(allModelMort)){
+  for(i in 1:ncv){
+    groupi = (cvgroups.in == i)
+    newdata.in = xy.in[cvgroups.in==i,]
+    
+    #LDA Model
+    ldafit = lda(allModelMort[[m]], data=xy.in, subset=(cvgroups.in!=i))       #Fit the current model using LDA with on the input data excluding the data in the current fold.
+    allpredictedcv10[cvgroups.in==i,m] = predict(ldafit,newdata.in)$class   #Predict the response from the data in the current fold and store into the matrix for that model.
+    
+    
+    #Logistic Regression Models
+    fit=glm(allModelMort[[m]],data=xy.in,subset=(cvgroups.in!=i),family="binomial")
+    test=predict(fit,newdata.in,type="response")
+    log5fact=rep(1,dim(newdata.in)[1]);log5fact[test>0.5] = 2
+    allpredictedcv10[groupi,m+1]=log5fact
+    
+  }
+}
+
+allpredictedcv10=allpredictedcv10-1
+allcv10 = rep(0,2)
+for (m in 1:2){
+  allcv10[m] = sum(xy.in$complication!=allpredictedcv10[,m])/n.in
+}
+bestmodelsMort=(1:2)[allcv10==min(allcv10)]
+
+bestmodelMortality = ifelse(length(bestmodelsMort)==1,bestmodelsMort,sample(bestmodelsMort,1)) #Determine the best model for the current fold
+allbestmodels[j] = bestmodelMortality #Store the best model for each fold to analyze at the end  
+  if(bestmodelMortality == 1){ #If the best model is less than or equal to 10, these refer to the LDA models
+      lda2fit.train=lda(allModelMort[[1]], data=trainxy.out)
+      predictvalid = as.numeric(predict(lda2fit.train, testxy.out)$class) #predict on outer validation data in the current fold
+      }
+  if (bestmodelMortality ==2) { #If the best model is greater than 20 , these refer to the logisitc regression models
+    log2fit.train = glm(allModelMort[[1]], data= trainxy.out, family=binomial) #Fit the model on the data not in the current fold
+    log2prob.test = predict(log2fit.train,testxy.out,type="response") #predict on outer validation data in the current fold
+    predictvalid = rep(1,dim(testxy.out)[1]); predictvalid[log2prob.test > 0.5] = 2
+  }
+    predictvalid = predictvalid-1  #Since the output matrix currently contains all 1's and 2's subtract 1 so the values can be compared to the original dataset.
+    allpredictedCV.out[groupj.out] = predictvalid #Store the predicted values from the current group into our output
+
+    
+    
+    surgery.bag = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=trainxy.out,mtry=2,importance=T) 
+surgery.bag
+
+RandomForestpredictedCV.out[groupj.out]= predict(surgery.bag,testxy.out,type="response") #Predict the wine quality of the outer loop test set 
+
+}
+table(HealthStatusSubset$mort30,allpredictedCV.out) #Create a table comparing predicted values to actual values
+CV10.out = sum(HealthStatusSubset$mort30!=allpredictedCV.out)/n.out #Calculate the error rate the best model
+p.out = 1-CV10.out;  # Calculate the accuracy of the best model
+
+RandomForestpredictedCV.out=RandomForestpredictedCV.out-1
+RandomForest.out = sum(HealthStatusSubset$mort30!=RandomForestpredictedCV.out)/n.out #Calculate the error rate the best model
+RFfinal=1-RandomForest.out;RFfinal #Calculate the accuracy of the Random Forest Model
+
+print(paste0("The accuracy for the best model at each individual outer loop split is: " , signif(p.out,digits=4)*100,"%"))
+print(paste0("The accuracy for the Random Forest model is: " , signif(RFfinal,digits=4)*100,"%"))
+##############################################
+###        End Selection Process           ###
+##############################################
+```
+From the results, it can be seen that all models provide the same overall error rate. Given this, it is important to fit the random forest using the full surgery data set in order to understand important relationships among the variables. This code will also fit the full dataset using Logistic Regression since that was the preferred model in the first model selection.
+```{r}
+#Create the full logistic regression model for predicting where the chances of an operation having a mortality 
+fullModelMort = glm(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,family="binomial")
+summary(fullModelMort)
+
+exp(coef(fullModelMort))
+
+```
+
+
+Predicting on new patient data
+```{r warning=FALSE}
+set.seed(8,sample.kind="Rounding")
+#Create Patient 1, an older individual with many underlying health conditions who is getting a colorectal resection procedure completed.
+newPatient1=data.frame(ahrq_ccs="Colorectal resection",age=85,asa_status="IV-VI",bmi=30.9,baseline_cancer="Yes",baseline_cvd="No",baseline_dementia="No",baseline_diabetes="Yes",baseline_digestive="Yes",baseline_osteoart="Yes",baseline_psych="No",baseline_pulmonary="Yes")
+Patient1 = predict(fullModelMort, newPatient1, type="response")
+
+newPatient2=data.frame(ahrq_ccs="Gastrectomy; partial and total",age=34,asa_status="III",bmi=22.9,baseline_cancer="No",baseline_cvd="Yes",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="Yes",baseline_psych="No",baseline_pulmonary="No")
+Patient2 = predict(fullModelMort, newPatient2, type="response")
+
+Determine_Mortality = function(prediction){
+  if(prediction >= .05){
+    Response=paste("High Risk:", round(prediction*100,2) ,"% Chance of Mortality")
+    return(Response)
+  }
+  else{
+    Response=paste("Low Risk:", round(prediction*100,2) ,"% Chance of Mortality")
+    return(Response)
+  }
+}
+
+print(paste0("Logistic Regression: Patient 3 Results - ", Determine_Mortality(Patient1)))
+print(paste0("Logistic Regression: Patient 4 Results - ", Determine_Mortality(Patient2)))
+```
+
+
+```{r warning=FALSE}
+set.seed(8,sample.kind="Rounding")
+#Set Patient 1 to have the same levels as used in training. Necessary for Random Forest Predictions
+newPatient1=data.frame(ahrq_ccs="Colorectal resection",age=85,asa_status="IV-VI",bmi=30.9,baseline_cancer="Yes",baseline_cvd="No",baseline_dementia="No",baseline_diabetes="Yes",baseline_digestive="Yes",baseline_osteoart="Yes",baseline_psych="No",baseline_pulmonary="Yes")
+
+newPatient1$ahrq_ccs = factor(newPatient1$ahrq_ccs, levels = c("<Other>","Arthroplasty knee","Colorectal resection","Endoscopy and endoscopic biopsy of the urinary tract","Gastrectomy; partial and total","Genitourinary incontinence procedures","Hip replacement; total and partial","Hysterectomy; abdominal and vaginal","Inguinal and femoral hernia repair","Laminectomy; excision intervertebral disc","Lumpectomy; quadrantectomy of breast","Mastectomy","Nephrectomy; partial or complete","Oophorectomy; unilateral and bilateral","Open prostatectomy","Other excision of cervix and uterus","Other hernia repair","Plastic procedures on nose","Repair of cystocele and rectocele; obliteration of vaginal vault","Small bowel resection","Spinal fusion","Thyroidectomy; partial or complete","Transurethral resection of prostate (TURP)"))
+newPatient1$asa_status = factor(newPatient1$asa_status, levels = c("I-II","III","IV-VI"))
+newPatient1$baseline_cancer = factor(newPatient1$baseline_cancer, levels = c("No","Yes"))
+newPatient1$baseline_cvd = factor(newPatient1$baseline_cvd, levels = c("No","Yes"))
+newPatient1$baseline_dementia = factor(newPatient1$baseline_dementia, levels = c("No","Yes"))
+newPatient1$baseline_diabetes = factor(newPatient1$baseline_diabetes, levels = c("No","Yes"))
+newPatient1$baseline_digestive = factor(newPatient1$baseline_digestive, levels = c("No","Yes"))
+newPatient1$baseline_osteoart = factor(newPatient1$baseline_osteoart, levels = c("No","Yes"))
+newPatient1$baseline_psych = factor(newPatient1$baseline_psych, levels = c("No","Yes"))
+newPatient1$baseline_pulmonary = factor(newPatient1$baseline_pulmonary, levels = c("No","Yes"))
+
+#Set Patient 2 to have the same levels as used in training. Necessary for Random Forest Predictions
+
+newPatient2=data.frame(ahrq_ccs="Gastrectomy; partial and total",age=34,asa_status="III",bmi=22.9,baseline_cancer="No",baseline_cvd="Yes",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="Yes",baseline_psych="No",baseline_pulmonary="No")
+newPatient2$ahrq_ccs = factor(newPatient2$ahrq_ccs, levels = c("<Other>","Arthroplasty knee","Colorectal resection","Endoscopy and endoscopic biopsy of the urinary tract","Gastrectomy; partial and total","Genitourinary incontinence procedures","Hip replacement; total and partial","Hysterectomy; abdominal and vaginal","Inguinal and femoral hernia repair","Laminectomy; excision intervertebral disc","Lumpectomy; quadrantectomy of breast","Mastectomy","Nephrectomy; partial or complete","Oophorectomy; unilateral and bilateral","Open prostatectomy","Other excision of cervix and uterus","Other hernia repair","Plastic procedures on nose","Repair of cystocele and rectocele; obliteration of vaginal vault","Small bowel resection","Spinal fusion","Thyroidectomy; partial or complete","Transurethral resection of prostate (TURP)"))
+newPatient2$asa_status = factor(newPatient2$asa_status, levels = c("I-II","III","IV-VI"))
+newPatient2$baseline_cancer = factor(newPatient2$baseline_cancer, levels = c("No","Yes"))
+newPatient2$baseline_cvd = factor(newPatient2$baseline_cvd, levels = c("No","Yes"))
+newPatient2$baseline_dementia = factor(newPatient2$baseline_dementia, levels = c("No","Yes"))
+newPatient2$baseline_diabetes = factor(newPatient2$baseline_diabetes, levels = c("No","Yes"))
+newPatient2$baseline_digestive = factor(newPatient2$baseline_digestive, levels = c("No","Yes"))
+newPatient2$baseline_osteoart = factor(newPatient2$baseline_osteoart, levels = c("No","Yes"))
+newPatient2$baseline_psych = factor(newPatient2$baseline_psych, levels = c("No","Yes"))
+newPatient2$baseline_pulmonary = factor(newPatient2$baseline_pulmonary, levels = c("No","Yes"))
+
+
+surgery.bagMort = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.95,0.05)) #The cutoff is the probability for each group selection, probs of 1% or higher are classified as 'Mortality' occuring
+
+RFPred1=predict(surgery.bagMort,newPatient1,type="prob")[2] #Mortality Prediction for Patient 1
+RFPred2=predict(surgery.bagMort,newPatient2,type="prob")[2] #Mortality Prediction for Patient 2
+
+print(paste0("Random Forest: Patient 3 Results - ", Determine_Mortality(RFPred1)))
+print(paste0("Random Forest: Patient 4 Results - ", Determine_Mortality(RFPred2)))
+```
+
+Random Forest Importance - Mortality
+```{r}
+#Random Forest - Complications Threshold Tuning
+
+set.seed(8,sample.kind="Rounding")
+
+surgery.bagMort = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.95,0.05)) #The cutoff is the probability for each group selection, probs of 1% or higher are classified as 'Mortality' occuring
+surgery.bagMort
+summary(surgery.bagMort)
+
+
+imp=as.data.frame(importance(surgery.bagMort)) #Analyze the importance of each variable in the model
+imp = cbind(vars=rownames(imp), imp)
+imp = imp[order(imp$MeanDecreaseAccuracy),]
+imp$vars = factor(imp$vars, levels=imp$vars)
+dotchart(imp$MeanDecreaseAccuracy, imp$vars, 
+         xlim=c(0,max(imp$MeanDecreaseAccuracy)), pch=16,xlab = "Mean Decrease Accuracy",main = "Mortality - Variable Importance Plot",color="black")
+```
+From the results above, when fitting the Random Forest model on the full dataset, and specifying a threshold of 5% to be considered a high risk of morality occuring, the models overall accuracy is 98.93% correct. In class accuracy is as follows:
+
+* Correctly Predicting No Mortality - 99.30% Accurate
+* Correctly Predicting Mortality - 8.55% Accurate
