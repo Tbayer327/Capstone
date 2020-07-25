@@ -9,9 +9,9 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-### Section 1: Read in the necessary packages for analysis
+### Section 1: Read in the necessary packages for analysis  
 
-```{r warning=FALSE, echo=FALSE, results=FALSE,message=FALSE }
+```{r warning=FALSE, results=FALSE,message=FALSE }
 #Import the necessary libraries
 library(MASS)
 library(ggplot2)
@@ -25,7 +25,7 @@ library(plyr)
 
 ### Section 2: Preparing the data for analysis
 
-```{r}
+```{r warning=FALSE}
 #Read in the data set
 surgery=read.csv("SurgeryTiming.csv")
 
@@ -62,7 +62,8 @@ summary(surgery)
 ```
 
 ### Section 3: Understanding the Effect of Timing on Patient Outcome
-```{r}
+##### In-Hospital Complications
+```{r warning=FALSE}
 #######################
 #### Complications ####
 #######################
@@ -100,8 +101,16 @@ ggplot(data=complications,aes(x=factor(month,level=c("Jan","Feb","Mar","Apr","Ma
   theme(plot.title = element_text(hjust = 0.5))
 
 surgery %>% group_by(month) %>% tally(complication==0) %>% arrange(desc(n))
+```
+
+From these results, it can be seen that as procedures move from early morning to evening, there is a significantly higher chance of in-hospital complications occurring Additionally, procedures that take place on Thursday or Friday are at a significantly higher odds of in-hospital complications compared to procedures that took place on Monday. Furthermore, these results show that procedures that take place in March, April, May and November have lower odds of in-hospital complications occurring compared to procedures that take place in January. 
+
+Additionally, there are a handful of procedures that greatly contribute to higher odds of an in-hospital complication occurring. Specifically, the highest risk procedure was a small bowel resection.
 
 
+
+##### 30 Day Mortality Rate
+```{r warning=FALSE}
 #######################
 ####   Mortality   ####
 #######################
@@ -140,16 +149,23 @@ ggplot(data=mortality,aes(x=factor(month,level=c("Jan","Feb","Mar","Apr","May","
   theme(plot.title = element_text(hjust = 0.5))
 ```
 
+
+From these results, it can also be seen that the hour a procedure takes place significantly impacts the likelihood of patient mortality. As procedures move from morning to evening, the odds of a mortality increase. There was no significant evidence that supports the day of week had an impact on increased patient mortality rates. Finally, it can be seen that for procedures that took place in October or November, there are less odds of a patient experiencing mortality within 30 days of their procedure completing. 
+
+
+Furthermore, the procedure type had a significant effect on patient outcome. Specifically, small bowel resections are the highest risk procedure.
+
+
 ### Section 4: Predicting Patient Outcome
-This section will walk through the steps taken in order to create models to predict the likliehood of a patient experiencing a complication or death 30 days following an elective procedure based on underlying health conditions.
-```{r}
-#Beign Modeling process for predicting complications/morality rate based on patients underlying health conditions
+This section will walk through the steps taken in order to create models to predict the likelihood of a patient experiencing a complication or death 30 days following an elective procedure based on underlying health conditions.
+```{r warning=FALSE}
+#Begin Modeling process for predicting complications/mortality rate based on a patient's underlying health conditions
 
 HealthStatusSubset = surgery[,c(-3,-4,-15,-16,-17,-18,-19,-20,-21,-22,-23)] #Create a subset of data that only includes the necessary fields.
 ```
 
-Define the two models, one for complication and one for mortality. These will contain the same predictor variables, but the response variable will be changed accordingly. 
-```{r}
+The first step is to define the two models, one for complication and one for mortality. These will contain the same predictor variables, but the response variable will be changed accordingly. 
+```{r warning=FALSE}
 #Create the two models, one for Complications and one for Mortality. Both will contain the same predictor variables
 Model1Comp = (complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary)
 allModelComp = list(Model1Comp)
@@ -158,16 +174,10 @@ Model1Mort = (mort30 ~ ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+
 allModelMort = list(Model1Mort)
 ```
 
+#### Complication Predictions
 
-######################################################
-######################################################
-######            Complication Section         #######
-######################################################
-######################################################
+###### Modeling Process via 10 Fold Cross Validation for Complications
 
-
-
-Modeling Process via 10 Fold Cross Validation for Complications
 ```{r warning=FALSE}
 ##############################################
 ###             Complication               ###
@@ -224,7 +234,7 @@ bestmodels=(1:3)[allcv10==min(allcv10)]
   if (bestmodels ==2){ #If the best model is between 11 and 20, these refer to the QDA models
     model="QDA"
   }
-  if (bestmodels ==3) { #If the best model is greater than 20 , these refer to the logisitc regression models
+  if (bestmodels ==3) { #If the best model is greater than 20 , these refer to the logistic regression models
     model = "Logistic Regression"
   }
 
@@ -237,13 +247,13 @@ print(paste0("LDA Error Rate: " ,allcv10[1]))
 print(paste0("QDA Error Rate: " ,allcv10[2]))
 print(paste0("Logistic Regression Error Rate: " ,allcv10[3]))
 ```
-###### Interpreting the Results
+#### Interpreting the Results:
 
 From the output, it can be seen that performing Logistic Regression on the model yielded the best model results. This model yields the lowest overall error rate of 13.27%. This model will be used to fit on the full dataset to get the most accurate coefficients for the predictor variables. By performing 1 layer of cross-validation, it can lead to underestimating the overall error rate of the model. To account for this underestimate, double cross-validation will be performed on the model selection process to validate our results. 
 
 Inside of the double cross validation, a new modeling method will also be considered. Random Forests will be introduced into the model fitting process to determine if the overall accuracy of prediction can be improved. Before performing double cross validation with Random Forests included, it is first important to determine the optimal value of 'mtry'. In order to determine which value of `mtry` produces the lowest overall error rate, a for loop will be used to loop over each individual value 1 to 11 (number of predictors considered at each split). By stripping the error rate of this model and storing it into a list, the lowest overall error rate will be selected and the `mtry` value used to obtain that error rate will be used in the final model. All predictor variables will be considered for the Random Forest.
 
-```{r}
+```{r warning=FALSE}
 #Random Forest - Complications
 set.seed(8,sample.kind="Rounding")
 errorRatesComp=rep(0,11) #Create placeholders for all error rates for every value of mtry
@@ -268,7 +278,7 @@ ggplot(data=ErrRateFinal,aes(x=mtry,y=error_rate))+ geom_line(color="grey")+geom
 
 From the plot above, it can be seen that the `mtry` value of 2 produces the model with the lowest overall error rate. Given this, the random forest will now be modeled using this value to get the importance of each variable in the model. Given the optimal value of `mtry` has now been identified, the below code will perform double cross validation to determine the accurate error rates of the LDA, QDA, Logistic Regression, and Random Forest Models.
 
-```{r}
+```{r warning=FALSE}
 xy.out=HealthStatusSubset
 n.out=dim(xy.out)[1]
 k.out=10
@@ -388,7 +398,7 @@ print(paste0("The accuracy for the Random Forest model is: " , signif(RFfinal,di
 ```
 From the results, it can be seen that all models provide relatively the same overall error rate, with Random Forests performing slightly better. Given this, it is important to fit the random forest using the full surgery data set in order to understand important relationships among the variables. This code will also fit the full dataset using Logistic Regression since that was the preferred model in the first model selection.
 
-```{r}
+```{r warning=FALSE}
 #Create the full logistic regression model for predicting where the chances of an operation having a complication
 fullModelComp = glm(complication~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,family="binomial")
 
@@ -397,8 +407,11 @@ summary(fullModelComp) #Receive coefficients for complication model
 exp(coef(fullModelComp)) #Retrieve odds ratio for complication model
 ```
 
-Predicting on new patient data
-```{r}
+#### Predicting on new patient data
+
+##### Logistic Regression Model
+
+```{r warning=FALSE}
 #Create Patient 1, an older individual with many underlying health conditions who is getting a colorectal resection procedure completed.
 newPatient1=data.frame(ahrq_ccs="Colorectal resection",age=70,asa_status="IV-VI",bmi=27.9,baseline_cancer="Yes",baseline_cvd="Yes",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="No",baseline_psych="No",baseline_pulmonary="No")
 Patient1 = predict(fullModelComp, newPatient1, type="response")
@@ -422,7 +435,9 @@ print(paste0("Patient 1 Results - ", Determine_Complication(Patient1)))
 print(paste0("Patient 2 Results - ", Determine_Complication(Patient2)))
 ```
 
-```{r}
+##### Random Forest Model
+
+```{r warning=FALSE}
 #Set Patient 1 to have the same levels as used in training. Necessary for Random Forest Predictions
 newPatient1=data.frame(ahrq_ccs="Colorectal resection",age=70,asa_status="IV-VI",bmi=27.9,baseline_cancer="Yes",baseline_cvd="Yes",baseline_dementia="No",baseline_diabetes="No",baseline_digestive="No",baseline_osteoart="No",baseline_psych="No",baseline_pulmonary="No")
 
@@ -461,8 +476,8 @@ print(paste0("Patient 1 Results - ", Determine_Complication(RFPred1)))
 print(paste0("Patient 2 Results - ", Determine_Complication(RFPred2)))
 ```
 
-Full Random Forest Model
-```{r}
+#### Full Random Forest Model - Complications
+```{r warning=FALSE}
 #Random Forest - Complications Threshold Tuning
 
 set.seed(8,sample.kind="Rounding")
@@ -478,18 +493,16 @@ imp$vars = factor(imp$vars, levels=imp$vars)
 dotchart(imp$MeanDecreaseAccuracy, imp$vars, 
          xlim=c(0,max(imp$MeanDecreaseAccuracy)), pch=16,xlab = "Mean Decrease Accuracy",main = "Complications - Variable Importance Plot",color="black")
 ```
+
+
 From the results above, when fitting the Random Forest model on the full dataset, and specifying a threshold of 10% to be considered a high risk of complication occuring, the models overall accuracy is 84.14% correct. In class accuracy is as follows:
 
 * Correctly Predicting No Complication - 94.36% Accurate
 * Correctly Predicting Complications - 17.11% Accurate
 
 
-######################################################
-######################################################
-######            Mortality Section            #######
-######################################################
-######################################################
-
+#### Mortality Predictions
+###### Modeling Process via 10 Fold Cross Validation for Mortality
 ```{r warning=FALSE}
 ##############################################
 ###             Mortality                  ###
@@ -538,7 +551,7 @@ bestmodels=(1:2)[allcv10==min(allcv10)]
   if(bestmodels == 1){ #If the best model is less than or equal to 10, these refer to the LDA models
     model="LDA"
   }
-  if (bestmodels ==2) { #If the best model is greater than 20 , these refer to the logisitc regression models
+  if (bestmodels ==2) { #If the best model is greater than 20 , these refer to the logistic regression models
     model = "Logistic Regression"
   }
 
@@ -550,11 +563,13 @@ print(paste0("The best model method was ", model, " using the formula (", FinalM
 print(paste0("LDA Error Rate: " ,allcv10[1]))
 print(paste0("Logistic Regression Error Rate: " ,allcv10[2]))
 ```
-From the output, it can be seen that performing logisitc regression on the mortality model yielded the best model results. This model yields the lowest overall erro rrate of 13.24%. This model will be used to fit on the full dataset to get the most accurate coefficients for the predictor variables. By performing 1 layer of cross-validation, it can lead to underestimating the overall error rate of the model. To account for this underestimate, double cross-validation will be performed on the model selection process to validate our results. 
+#### Interpreting the Results
+
+From the output, it can be seen that performing logistic regression on the mortality model yielded the best model results. This model yields the lowest overall error rate of 13.24%. This model will be used to fit on the full dataset to get the most accurate coefficients for the predictor variables. By performing 1 layer of cross-validation, it can lead to underestimating the overall error rate of the model. To account for this underestimate, double cross-validation will be performed on the model selection process to validate our results. 
 
 Inside of the double cross validation, a new modeling method will also be considered. Random Forests will be introduced into the model fitting process to determine if the overall accuracy of prediction can be improved. Before performing double cross validation with Random Forests included, it is first important to determine the optimal value of 'mtry'. In order to determine which value of `mtry` produces the lowest overall error rate, a for loop will be used to loop over each individual value 1 to 11 (number of predictors considered at each split). By stripping the error rate of this model and storing it into a list, the lowest overall error rate will be selected and the `mtry` value used to obtain that error rate will be used in the final model. All predictor variables will be considered for the Random Forest.
 
-```{r}
+```{r warning=FALSE}
 #Random Forest - Mortality
 set.seed(8,sample.kind="Rounding")
 errorRatesMort=rep(0,11) #Create placeholders for all error rates for every value of mtry
@@ -573,12 +588,12 @@ min(ErrRateFinal$error_rate) #Determine which 'mtry' value had the lowest overal
 
 ggplot(data=ErrRateFinal, aes(x=mtry,y=error_rate))+ geom_line(color="grey")+geom_point(shape=21,color="black",fill="#69b3a2",size=3)+scale_x_continuous(limits = c(1, 11), breaks = 1:11)+ggtitle("Mortality Error Rates Related to MTRY Value")+
   theme(plot.title = element_text(hjust = 0.5))+xlab("MTRY Value")+ylab("Error Rate") #Plot all error rates for visual representation #Plot all error rates for visual representation
-
-
 ```
 
 
-```{r}
+From the plot above, it can be seen that the `mtry` value of 1 or 2 produces the model with the lowest overall error rate. Given this, the random forest will now be modeled using this value to get the importance of each variable in the model. Given the optimal value of `mtry` has now been identified, the below code will perform double cross validation to determine the accurate error rates of the LDA, Logistic Regression, and Random Forest Models.
+
+```{r warning=FALSE}
 xy.out=HealthStatusSubset
 n.out=dim(xy.out)[1]
 k.out=10
@@ -686,8 +701,12 @@ print(paste0("The accuracy for the Random Forest model is: " , signif(RFfinal,di
 ###        End Selection Process           ###
 ##############################################
 ```
+
+
 From the results, it can be seen that all models provide the same overall error rate. Given this, it is important to fit the random forest using the full surgery data set in order to understand important relationships among the variables. This code will also fit the full dataset using Logistic Regression since that was the preferred model in the first model selection.
-```{r}
+
+
+```{r warning=FALSE}
 #Create the full logistic regression model for predicting where the chances of an operation having a mortality 
 fullModelMort = glm(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,family="binomial")
 summary(fullModelMort)
@@ -697,7 +716,10 @@ exp(coef(fullModelMort))
 ```
 
 
-Predicting on new patient data
+#### Predicting on new patient data
+
+##### Logistic Regression Model
+
 ```{r warning=FALSE}
 set.seed(8,sample.kind="Rounding")
 #Create Patient 1, an older individual with many underlying health conditions who is getting a colorectal resection procedure completed.
@@ -722,6 +744,7 @@ print(paste0("Logistic Regression: Patient 3 Results - ", Determine_Mortality(Pa
 print(paste0("Logistic Regression: Patient 4 Results - ", Determine_Mortality(Patient2)))
 ```
 
+##### Random Forest Model
 
 ```{r warning=FALSE}
 set.seed(8,sample.kind="Rounding")
@@ -754,7 +777,7 @@ newPatient2$baseline_psych = factor(newPatient2$baseline_psych, levels = c("No",
 newPatient2$baseline_pulmonary = factor(newPatient2$baseline_pulmonary, levels = c("No","Yes"))
 
 
-surgery.bagMort = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.95,0.05)) #The cutoff is the probability for each group selection, probs of 1% or higher are classified as 'Mortality' occuring
+surgery.bagMort = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.95,0.05)) #The cutoff is the probability for each group selection, probs of 1% or higher are classified as 'Mortality' occurring
 
 RFPred1=predict(surgery.bagMort,newPatient1,type="prob")[2] #Mortality Prediction for Patient 1
 RFPred2=predict(surgery.bagMort,newPatient2,type="prob")[2] #Mortality Prediction for Patient 2
@@ -763,13 +786,13 @@ print(paste0("Random Forest: Patient 3 Results - ", Determine_Mortality(RFPred1)
 print(paste0("Random Forest: Patient 4 Results - ", Determine_Mortality(RFPred2)))
 ```
 
-Random Forest Importance - Mortality
-```{r}
+#### Full Random Forest Model - Mortality
+```{r warning=FALSE}
 #Random Forest - Complications Threshold Tuning
 
 set.seed(8,sample.kind="Rounding")
 
-surgery.bagMort = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.95,0.05)) #The cutoff is the probability for each group selection, probs of 1% or higher are classified as 'Mortality' occuring
+surgery.bagMort = randomForest(mort30~ahrq_ccs+age+asa_status+bmi+baseline_cancer+baseline_cvd+baseline_dementia+baseline_diabetes+baseline_digestive+baseline_osteoart+baseline_psych+baseline_pulmonary,data=surgery,mtry=2,importance=T,cutoff=c(0.95,0.05)) #The cutoff is the probability for each group selection, probs of 1% or higher are classified as 'Mortality' occurring
 surgery.bagMort
 summary(surgery.bagMort)
 
@@ -781,7 +804,8 @@ imp$vars = factor(imp$vars, levels=imp$vars)
 dotchart(imp$MeanDecreaseAccuracy, imp$vars, 
          xlim=c(0,max(imp$MeanDecreaseAccuracy)), pch=16,xlab = "Mean Decrease Accuracy",main = "Mortality - Variable Importance Plot",color="black")
 ```
-From the results above, when fitting the Random Forest model on the full dataset, and specifying a threshold of 5% to be considered a high risk of morality occuring, the models overall accuracy is 98.93% correct. In class accuracy is as follows:
+
+From the results above, when fitting the Random Forest model on the full dataset, and specifying a threshold of 5% to be considered a high risk of mortality occurring, the models overall accuracy is 98.93% correct. In class accuracy is as follows:
 
 * Correctly Predicting No Mortality - 99.30% Accurate
 * Correctly Predicting Mortality - 8.55% Accurate
